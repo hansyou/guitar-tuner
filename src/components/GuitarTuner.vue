@@ -80,6 +80,13 @@ const isListening = ref(false)
 const detected = reactive({ name: '--', cents: 0, freq: 0, confidence: 0 })
 const playingString = ref(-1)
 
+// Keep the last detected note on screen briefly after the sound stops,
+// so the player has time to read it before the display resets.
+const HOLD_DURATION = 2500 // ms
+const holding = ref(false)
+let hasDetected = false
+let lastDetectionTime = 0
+
 const tuning = computed(() => TUNINGS[tuningIndex.value])
 const targetFreqs = computed(() => tuning.value.notes.map(noteToFreq))
 
@@ -170,6 +177,9 @@ function processAudio() {
     detected.cents = note.cents
     detected.freq = note.freq
     detected.confidence = 1
+    hasDetected = true
+    lastDetectionTime = performance.now()
+    holding.value = false
 
     // Find closest target string
     const freqs = targetFreqs.value
@@ -191,12 +201,19 @@ function processAudio() {
       activeString.value = -1
     }
   } else {
-    detected.confidence = Math.max(0, detected.confidence - 0.05)
-    if (detected.confidence < 0.01) {
+    // No valid pitch this frame. Hold the last result for a moment
+    // instead of immediately clearing it, so the reading stays visible.
+    if (hasDetected && performance.now() - lastDetectionTime < HOLD_DURATION) {
+      holding.value = true
+      detected.confidence = 0.6 // slightly dimmed to show it's no longer live
+    } else if (hasDetected) {
       detected.name = '--'
       detected.cents = 0
       detected.freq = 0
+      detected.confidence = 0
       activeString.value = -1
+      hasDetected = false
+      holding.value = false
     }
   }
 
@@ -219,6 +236,8 @@ async function startListening() {
     micSource.connect(analyser)
 
     isListening.value = true
+    hasDetected = false
+    holding.value = false
     processAudio()
   } catch (e) {
     console.error('Microphone access denied:', e)
@@ -243,6 +262,8 @@ function stopListening() {
   detected.cents = 0
   detected.freq = 0
   detected.confidence = 0
+  hasDetected = false
+  holding.value = false
 }
 
 // ─── Karplus-Strong plucked string synthesis ────────────────────
@@ -467,13 +488,14 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
         <!-- Detection display -->
         <div class="detection" v-if="isListening">
           <div class="detected-note">
-            <span class="note-name" :class="{ dim: !detected.confidence }">
+            <span class="note-name" :class="{ dim: !detected.confidence, holding: holding }">
               <span v-if="detectedDisplay.letter !== '--'">
                 {{ detectedDisplay.letter }}<sup v-if="detectedDisplay.acc">{{ detectedDisplay.acc }}</sup><sub>{{ detectedDisplay.octave }}</sub>
               </span>
               <span v-else>--</span>
             </span>
             <span class="note-freq" v-if="detected.freq">{{ detected.freq }} Hz</span>
+            <span class="hold-hint" v-if="holding">音已识别 · 保持显示中</span>
           </div>
 
           <!-- Cents meter -->
@@ -774,11 +796,22 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
   color: #ccc;
 }
 
+.note-name.holding {
+  opacity: 0.55;
+}
+
 .note-freq {
   font-size: 0.8rem;
   color: var(--text-dim);
   font-family: 'SF Mono', 'Cascadia Code', monospace;
   margin-top: 2px;
+}
+
+.hold-hint {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  margin-top: 4px;
 }
 
 /* Cents meter */
