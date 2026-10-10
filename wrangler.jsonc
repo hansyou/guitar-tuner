@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // Worker 名称，对应 https://guitar-tuner.fansong-yan.workers.dev
+  "name": "guitar-tuner",
+  "compatibility_date": "2026-10-10",
+  // 纯静态资源部署：直接托管 vite 构建产物 dist/ 目录
+  "assets": {
+    "directory": "./dist"
+  }
+}

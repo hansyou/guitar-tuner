@@ -1,7 +1,7 @@
 <script setup>
-import { ref, reactive, computed, onUnmounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 
-// ─── Tuning Presets ─────────────────────────────────────────────
+// ─── 调弦预设 ───────────────────────────────────────────────────
 const TUNINGS = [
   { label: 'Standard (E A D G B E)', notes: ['E2','A2','D3','G3','B3','E4'] },
   { label: 'Drop D (D A D G B E)',   notes: ['D2','A2','D3','G3','B3','E4'] },
@@ -24,16 +24,17 @@ const NOTE_TO_FREQ = {
 
 const CHROMATIC = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
 
-// Parse note name like "E2", "F#3" etc. to frequency
+// 将音名（如 "E2"、"F#3"）转换为频率
 function noteToFreq(note) {
   return NOTE_TO_FREQ[note] || 0
 }
 
-// Parse note name into display parts: "F#3" → { letter: 'F', acc: '♯', octave: '3' }
+// 解析音名为显示部件："F#3" → { letter: 'F', acc: '♯', octave: '3' }
+// 同时兼容 "#"/"b" 与显示用字符 "♯"/"♭"。
 function parseNote(raw) {
-  const m = raw.match(/^([A-G])([#b])(\d)$/)
+  const m = raw.match(/^([A-G])([#♯b♭])(\d)$/)
   if (m) {
-    return { letter: m[1], acc: m[2] === '#' ? '♯' : '♭', octave: m[3] }
+    return { letter: m[1], acc: m[2] === 'b' || m[2] === '♭' ? '♭' : '♯', octave: m[3] }
   }
   const m2 = raw.match(/^([A-G])(\d)$/)
   if (m2) {
@@ -44,18 +45,22 @@ function parseNote(raw) {
 
 const parsedNotes = computed(() => tuning.value.notes.map(parseNote))
 
-// Detected note display
+// 琴弦显示顺序：1弦（最细）在最上方，6弦（最粗）在最下方
+// 仅倒序显示，内部索引仍按 0=6弦 … 5=1弦 对应调弦数据
+const stringOrder = computed(() => tuning.value.notes.map((_, i) => i).reverse())
+
+// 已识别音名的显示
 const detectedDisplay = computed(() => {
   if (!detected.name || detected.name === '--') return { letter: '--', acc: '', octave: '' }
   return parseNote(detected.name)
 })
 
-// Convert frequency to MIDI number
+// 将频率转换为 MIDI 音高编号
 function freqToMidi(freq) {
   return 12 * (Math.log2(freq) - Math.log2(440)) + 69
 }
 
-// Convert frequency to closest note name with cents
+// 将频率转换为最近的音名及音分偏差
 function freqToNote(freq) {
   if (freq <= 0) return { name: '--', cents: 0, freq: 0 }
   const midi = freqToMidi(freq)
@@ -72,17 +77,42 @@ function freqToNote(freq) {
   }
 }
 
-// ─── State ──────────────────────────────────────────────────────
+// ─── 状态 ────────────────────────────────────────────────────────
 const tuningIndex = ref(0)
-const mode = ref('listen') // 'listen' | 'reference'
+
+// 调弦下拉菜单状态
+const dropdownOpen = ref(false)
+const selectWrapEl = ref(null)
+
+// 选择调弦并关闭下拉菜单
+function chooseTuning(i) {
+  tuningIndex.value = i
+  dropdownOpen.value = false
+}
+
+// 点击菜单外部时关闭下拉菜单
+function handleDocClick(e) {
+  if (selectWrapEl.value && !selectWrapEl.value.contains(e.target)) {
+    dropdownOpen.value = false
+  }
+}
+
+onMounted(() => document.addEventListener('click', handleDocClick))
+onUnmounted(() => document.removeEventListener('click', handleDocClick))
+const mode = ref('listen') // 模式：'listen' 实时听音 | 'reference' 听音调弦
 const activeString = ref(-1)
 const isListening = ref(false)
 const detected = reactive({ name: '--', cents: 0, freq: 0, confidence: 0 })
 const playingString = ref(-1)
 
-// Keep the last detected note on screen briefly after the sound stops,
-// so the player has time to read it before the display resets.
-const HOLD_DURATION = 2500 // ms
+// 声音停止后仍短暂保留最后一次识别的音符，
+// 让用户有时间读取，之后显示才会复位。
+const HOLD_DURATION = 2500 // 毫秒
+
+// 采样分析间隔（毫秒）：每 0.2 秒分析一次，
+// 避免逐帧更新导致读数频繁跳动
+const ANALYSIS_INTERVAL = 200
+let lastAnalysisTime = 0
 const holding = ref(false)
 let hasDetected = false
 let lastDetectionTime = 0
@@ -90,7 +120,7 @@ let lastDetectionTime = 0
 const tuning = computed(() => TUNINGS[tuningIndex.value])
 const targetFreqs = computed(() => tuning.value.notes.map(noteToFreq))
 
-// ─── Audio state ────────────────────────────────────────────────
+// ─── 音频状态 ────────────────────────────────────────────────────
 let audioCtx = null
 let currentSource = null
 let analyser = null
@@ -98,17 +128,17 @@ let mediaStream = null
 let animationId = null
 let micSource = null
 
-// ─── Pitch detection (autocorrelation) ──────────────────────────
+// ─── 音高检测（自相关算法） ──────────────────────────────────────
 function autoCorrelate(buffer, sampleRate) {
-  // RMS check
+  // RMS 能量检查
   let rms = 0
   for (let i = 0; i < buffer.length; i++) rms += buffer[i] * buffer[i]
   rms = Math.sqrt(rms / buffer.length)
   if (rms < 0.005) return -1
 
   const size = buffer.length
-  const minPeriod = Math.floor(sampleRate / 1600) // ~1600Hz max
-  const maxPeriod = Math.floor(sampleRate / 30)   // ~30Hz min for guitar
+  const minPeriod = Math.floor(sampleRate / 1600) // 最高约 1600Hz
+  const maxPeriod = Math.floor(sampleRate / 30)   // 吉他最低约 30Hz
 
   let bestPeriod = 0
   let bestCorr = 0
@@ -125,9 +155,11 @@ function autoCorrelate(buffer, sampleRate) {
     }
   }
 
-  if (bestCorr < 0.1 || bestPeriod === 0) return -1
+  // 与信号能量（rms²）比较，而不是使用固定绝对阈值，
+  // 这样轻弹也能被识别。周期性达到约 20% 能量即视为真实音高。
+  if (bestCorr < 0.2 * rms * rms || bestPeriod === 0) return -1
 
-  // Parabolic interpolation for better accuracy
+  // 抛物线插值以提高精度
   const y0 = bestCorr
   const y1 = bestPeriod > minPeriod
     ? (() => {
@@ -160,9 +192,16 @@ function autoCorrelate(buffer, sampleRate) {
   return sampleRate / refinedPeriod
 }
 
-// ─── Audio processing loop ──────────────────────────────────────
+// ─── 音频处理循环 ────────────────────────────────────────────────
 function processAudio() {
   if (!analyser) return
+  // 无论是否分析，都保持动画循环运行
+  animationId = requestAnimationFrame(processAudio)
+
+  // 按 ANALYSIS_INTERVAL 节流：间隔未到则跳过本次分析
+  const now = performance.now()
+  if (now - lastAnalysisTime < ANALYSIS_INTERVAL) return
+  lastAnalysisTime = now
 
   const bufferLength = analyser.fftSize
   const buffer = new Float32Array(bufferLength)
@@ -181,7 +220,7 @@ function processAudio() {
     lastDetectionTime = performance.now()
     holding.value = false
 
-    // Find closest target string
+    // 找到最接近的目标琴弦
     const freqs = targetFreqs.value
     let minDiff = Infinity
     let closest = -1
@@ -194,18 +233,18 @@ function processAudio() {
         }
       }
     })
-    // Only activate if within ~2 semitones
+    // 仅在偏差约 2 个半音以内时才高亮该弦
     if (closest >= 0 && minDiff < targetFreqs.value[closest] * 0.12) {
       activeString.value = closest
     } else {
       activeString.value = -1
     }
   } else {
-    // No valid pitch this frame. Hold the last result for a moment
-    // instead of immediately clearing it, so the reading stays visible.
+    // 本帧没有有效音高。短暂保留上一次结果，
+    // 而不是立即清空，让读数保持可见。
     if (hasDetected && performance.now() - lastDetectionTime < HOLD_DURATION) {
       holding.value = true
-      detected.confidence = 0.6 // slightly dimmed to show it's no longer live
+      detected.confidence = 0.6 // 稍微变暗，表示不再是实时数据
     } else if (hasDetected) {
       detected.name = '--'
       detected.cents = 0
@@ -216,11 +255,9 @@ function processAudio() {
       holding.value = false
     }
   }
-
-  animationId = requestAnimationFrame(processAudio)
 }
 
-// ─── Start microphone ──────────────────────────────────────────
+// ─── 启动麦克风 ──────────────────────────────────────────────────
 async function startListening() {
   if (isListening.value) return
   try {
@@ -264,12 +301,12 @@ function stopListening() {
   detected.confidence = 0
   hasDetected = false
   holding.value = false
+  lastAnalysisTime = 0 // 重新监听时立即进行第一次分析
 }
 
-// ─── Karplus-Strong plucked string synthesis ────────────────────
-// Physical modeling of a plucked string: noise burst excites a
-// feedback delay line with a low-pass filter, producing a rich,
-// guitar-like tone with natural harmonics and decay.
+// ─── Karplus-Strong 拨弦合成 ────────────────────────────────────
+// 拨弦物理建模：噪声脉冲激励带低通滤波的反馈延迟线，
+// 产生带有自然泛音与衰减、音色丰富的吉他音。
 function synthesizeString(audioCtx, freq, duration) {
   const sampleRate = audioCtx.sampleRate
   const period = Math.round(sampleRate / freq)
@@ -278,33 +315,33 @@ function synthesizeString(audioCtx, freq, duration) {
   const buffer = audioCtx.createBuffer(1, totalSamples, sampleRate)
   const data = buffer.getChannelData(0)
 
-  // ── Excitation: shaped noise burst with exponential decay ──
-  // This simulates the initial string pluck with a pick
+  // ── 激励：指数衰减的整形噪声脉冲 ──
+  // 模拟拨片初次拨动琴弦的瞬态
   const exciterLen = Math.min(period, Math.ceil(sampleRate * 0.008))
   for (let i = 0; i < exciterLen; i++) {
-    // Triangle-shaped amplitude envelope on white noise
+    // 白噪声上的三角形幅度包络
     const env = 1 - i / exciterLen
     data[i] = (Math.random() * 2 - 1) * 0.6 * env * env
   }
 
-  // ── Karplus-Strong delay line with low-pass damping ──────────
-  // damping: 0.998 gives a long ring (~3s for guitar), 0.99 dies faster
-  // brightness: controls LP filter cutoff (higher = brighter)
-  // For low strings, slightly less damping to compensate for physical decay
-  const brightness = 0.4 + 0.6 * (freq / 440) // brighter for higher notes
-  const damping = 0.997 + 0.0015 * (freq / 440) // longer sustain for low notes
+  // ── Karplus-Strong 延迟线与低通阻尼 ──────────
+  // damping（阻尼）：0.998 延音长（吉他约 3 秒），0.99 衰减更快
+  // brightness（明亮度）：控制低通滤波器截止频率（越高越明亮）
+  // 低音弦阻尼略小，以补偿物理衰减
+  const brightness = 0.4 + 0.6 * (freq / 440) // 音越高越明亮
+  const damping = 0.997 + 0.0015 * (freq / 440) // 低音延音更长
 
   for (let i = period; i < totalSamples; i++) {
-    // Two-point moving average as low-pass filter in the feedback path
+    // 反馈回路中用两点移动平均作低通滤波
     const delayed = data[i - period]
     const delayedPrev = i - period - 1 >= 0 ? data[i - period - 1] : delayed
-    // Blend: weighted average between delayed sample and its neighbor
-    // This acts as a simple 1st-order low-pass on the feedback
+    // 混合：延迟样本与其相邻样本的加权平均
+    // 对反馈信号构成一个简单的一阶低通滤波
     const blended = brightness * delayed + (1 - brightness) * delayedPrev
     data[i] = blended * damping
   }
 
-  // ── Gentle fade-out to avoid click ───────────────────────────
+  // ── 平滑淡出，避免爆音 ───────────────────────────
   const fadeStart = totalSamples - Math.ceil(sampleRate * 0.05)
   for (let i = Math.max(0, fadeStart); i < totalSamples; i++) {
     const fadeProgress = (i - fadeStart) / (totalSamples - fadeStart)
@@ -314,7 +351,7 @@ function synthesizeString(audioCtx, freq, duration) {
   return buffer
 }
 
-// ─── Play reference tone ────────────────────────────────────────
+// ─── 播放参考音 ──────────────────────────────────────────────────
 async function playReference(stringIdx) {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)()
@@ -330,16 +367,16 @@ async function playReference(stringIdx) {
 
   playingString.value = stringIdx
 
-  // Synthesize the plucked string sound
-  const duration = 3.0 // 3-second ring with natural decay
+  // 合成拨弦音色
+  const duration = 3.0 // 3 秒自然衰减的延音
   const buffer = synthesizeString(audioCtx, freq, duration)
 
   const source = audioCtx.createBufferSource()
   source.buffer = buffer
 
   const gainNode = audioCtx.createGain()
-  // Mild gain envelope: quick attack, then let the buffer's natural
-  // decay handle the rest
+  // 温和的增益包络：快速起音，
+  // 其余交给缓冲区的自然衰减
   gainNode.gain.setValueAtTime(0, audioCtx.currentTime)
   gainNode.gain.linearRampToValueAtTime(0.7, audioCtx.currentTime + 0.008)
   gainNode.gain.setValueAtTime(0.7, audioCtx.currentTime + duration - 0.05)
@@ -369,7 +406,7 @@ function stopReference() {
   playingString.value = -1
 }
 
-// ─── Toggle mode ────────────────────────────────────────────────
+// ─── 切换模式 ────────────────────────────────────────────────────
 function switchMode(newMode) {
   if (mode.value === newMode) return
   mode.value = newMode
@@ -381,7 +418,7 @@ function switchMode(newMode) {
   }
 }
 
-// ─── Cleanup ────────────────────────────────────────────────────
+// ─── 资源清理 ────────────────────────────────────────────────────
 onUnmounted(() => {
   stopListening()
   stopReference()
@@ -391,17 +428,17 @@ onUnmounted(() => {
   }
 })
 
-// Watch: auto-start listen when component mounts is not done automatically
-// Let the user start it manually via the toggle
+// 组件挂载时不自动开始监听，
+// 由用户点击按钮手动启动
 
-// ─── Helpers ────────────────────────────────────────────────────
+// ─── 辅助函数 ────────────────────────────────────────────────────
 function formatCents(cents) {
   if (cents === 0) return '±0¢'
   return cents > 0 ? `+${cents}¢` : `${cents}¢`
 }
 
 function centsOffset(cents) {
-  // Normalize to -50..50 range
+  // 归一化到 -50..50 范围
   let c = cents
   while (c > 50) c -= 100
   while (c < -50) c += 100
@@ -409,7 +446,7 @@ function centsOffset(cents) {
 }
 
 function centsToPercent(cents) {
-  // -50 => 0%, 0 => 50%, +50 => 100%
+  // -50 音分 => 0%，0 => 50%，+50 => 100%
   return 50 + centsOffset(cents) * 0.5
 }
 
@@ -422,17 +459,35 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
       <h1 class="title">🎸 吉他调音器</h1>
     </header>
 
-    <!-- Tuning selector -->
-    <section class="section">
+    <!-- 调弦选择（自定义玻璃下拉菜单） -->
+    <section :class="['section', { 'dropdown-open': dropdownOpen }]">
       <label class="label">调弦选择</label>
-      <select v-model.number="tuningIndex" class="select">
-        <option v-for="(t, i) in TUNINGS" :key="i" :value="i">
-          {{ t.label }}
-        </option>
-      </select>
+      <div ref="selectWrapEl" class="select-wrap">
+        <button
+          type="button"
+          :class="['select-btn', { open: dropdownOpen }]"
+          @click="dropdownOpen = !dropdownOpen"
+        >
+          <span class="select-value">{{ tuning.label }}</span>
+          <span :class="['select-arrow', { open: dropdownOpen }]"></span>
+        </button>
+        <Transition name="dropdown">
+          <ul v-if="dropdownOpen" class="select-menu">
+            <li
+              v-for="(t, i) in TUNINGS"
+              :key="i"
+              :class="['select-option', { active: tuningIndex === i }]"
+              @click="chooseTuning(i)"
+            >
+              <span>{{ t.label }}</span>
+              <span v-if="tuningIndex === i" class="select-check">✓</span>
+            </li>
+          </ul>
+        </Transition>
+      </div>
     </section>
 
-    <!-- Mode toggle -->
+    <!-- 模式切换 -->
     <section class="section">
       <div class="mode-tabs">
         <button
@@ -450,13 +505,13 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
       </div>
     </section>
 
-    <!-- Reference mode -->
+    <!-- 听音调弦模式 -->
     <template v-if="mode === 'reference'">
       <section class="section">
         <p class="hint">点击琴弦播放标准音，对照调弦</p>
         <div class="strings">
           <button
-            v-for="(pn, i) in parsedNotes"
+            v-for="i in stringOrder"
             :key="i"
             :class="['string-btn', { playing: playingString === i }]"
             :style="{ '--color': stringColors[i] }"
@@ -464,7 +519,7 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
           >
             <span class="string-num">{{ STRING_NAMES[i] }}</span>
             <span class="string-note">
-              {{ pn.letter }}<sup v-if="pn.acc">{{ pn.acc }}</sup><sub>{{ pn.octave }}</sub>
+              {{ parsedNotes[i].letter }}<sup v-if="parsedNotes[i].acc">{{ parsedNotes[i].acc }}</sup><sub>{{ parsedNotes[i].octave }}</sub>
             </span>
             <span class="string-freq">{{ targetFreqs[i].toFixed(1) }}Hz</span>
           </button>
@@ -472,7 +527,7 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
       </section>
     </template>
 
-    <!-- Listen mode -->
+    <!-- 实时听音模式 -->
     <template v-if="mode === 'listen'">
       <section class="section">
         <div class="mic-area">
@@ -485,7 +540,7 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
           </button>
         </div>
 
-        <!-- Detection display -->
+        <!-- 识别结果显示 -->
         <div class="detection" v-if="isListening">
           <div class="detected-note">
             <span class="note-name" :class="{ dim: !detected.confidence, holding: holding }">
@@ -498,12 +553,12 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
             <span class="hold-hint" v-if="holding">音已识别 · 保持显示中</span>
           </div>
 
-          <!-- Cents meter -->
+          <!-- 音分表 -->
           <div class="meter-wrap">
             <div class="meter-track">
               <div class="meter-fill" :style="{ width: centsToPercent(detected.cents) + '%' }"></div>
               <div class="meter-center"></div>
-              <!-- Target markers -->
+              <!-- 目标音标记 -->
               <div
                 v-for="(freq, i) in targetFreqs"
                 :key="i"
@@ -524,17 +579,17 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
               </span>
               <span>偏高 ♯</span>
             </div>
-            <div class="cents-value" v-if="detected.cents">
-              <span :class="{ good: Math.abs(centsOffset(detected.cents)) < 5, ok: Math.abs(centsOffset(detected.cents)) < 15 }">
+            <div class="cents-value" v-if="detected.freq">
+              <span :class="{ good: Math.abs(centsOffset(detected.cents)) < 5, ok: Math.abs(centsOffset(detected.cents)) >= 5 && Math.abs(centsOffset(detected.cents)) < 15 }">
                 {{ formatCents(centsOffset(detected.cents)) }}
               </span>
             </div>
           </div>
 
-          <!-- All strings status -->
+          <!-- 各琴弦状态 -->
           <div class="string-status-list">
             <div
-              v-for="(note, i) in tuning.notes"
+              v-for="i in stringOrder"
               :key="i"
               :class="['string-row', { active: activeString === i, 'dimmed': activeString >= 0 && activeString !== i }]"
             >
@@ -593,10 +648,20 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
 }
 
 .section {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  border-radius: 20px;
   padding: 18px;
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  box-shadow: var(--glass-shadow), var(--glass-highlight);
+}
+
+/* backdrop-filter 会创建层叠上下文：玻璃卡片的 z-index 出不了本卡片，
+   下方的兄弟卡片会盖住弹出菜单。菜单展开时把所属卡片整体提到最上层 */
+.section.dropdown-open {
+  position: relative;
+  z-index: 30;
 }
 
 .label {
@@ -606,60 +671,149 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
   margin-bottom: 8px;
 }
 
-.select {
+/* 调弦下拉菜单（自定义组件，保证整体液态玻璃风格一致） */
+.select-wrap {
+  position: relative;
+}
+
+.select-btn {
   width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   padding: 10px 14px;
-  background: var(--surface);
+  background: rgba(255, 255, 255, 0.5);
   color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
   font-size: 0.95rem;
-  appearance: none;
   cursor: pointer;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%23999' d='M6 8L0 0h12z'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 14px center;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: var(--glass-highlight), 0 1px 3px rgba(0, 0, 0, 0.04);
+  transition: background 0.15s, border-color 0.15s;
 }
 
-.select:focus {
-  outline: none;
-  border-color: var(--accent);
+.select-btn:hover,
+.select-btn.open {
+  background: rgba(255, 255, 255, 0.65);
+  border-color: rgba(0, 122, 255, 0.35);
 }
 
-/* Mode tabs */
+.select-value {
+  flex: 1;
+  text-align: left;
+}
+
+/* 下拉箭头 */
+.select-arrow {
+  width: 10px;
+  height: 10px;
+  margin-left: 10px;
+  background-color: var(--text-dim);
+  clip-path: polygon(0% 25%, 50% 75%, 100% 25%, 100% 50%, 50% 100%, 0% 50%);
+  transition: transform 0.2s;
+}
+
+.select-arrow.open {
+  transform: rotate(180deg);
+}
+
+/* 弹出菜单面板 */
+.select-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  /* 浮层专用高不透明度玻璃 + 强模糊，避免下层文字透上来干扰阅读 */
+  background: var(--glass-strong);
+  border: 1px solid var(--glass-border);
+  border-radius: 14px;
+  backdrop-filter: blur(32px) saturate(180%);
+  -webkit-backdrop-filter: blur(32px) saturate(180%);
+  box-shadow: 0 14px 36px rgba(30, 41, 80, 0.2), var(--glass-highlight);
+}
+
+.select-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 0.95rem;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.select-option:hover {
+  background: rgba(30, 41, 80, 0.07);
+}
+
+/* 选中项：深色玻璃胶囊 */
+.select-option.active {
+  background: var(--primary);
+  color: #fff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+
+.select-check {
+  font-size: 0.85rem;
+}
+
+/* 下拉动画 */
+.dropdown-enter-active,
+.dropdown-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.dropdown-enter-from,
+.dropdown-leave-to {
+  opacity: 0;
+  transform: translateY(-6px) scale(0.98);
+}
+
+/* 模式切换标签（macOS 分段控件样式） */
 .mode-tabs {
   display: flex;
-  gap: 0;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.3);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: var(--glass-highlight), inset 0 1px 4px rgba(30, 41, 80, 0.06);
 }
 
 .mode-tab {
   flex: 1;
-  padding: 10px 0;
-  background: var(--card);
+  padding: 9px 0;
+  background: transparent;
   color: var(--text-dim);
   border: none;
+  border-radius: 9px;
   font-size: 0.9rem;
   cursor: pointer;
-  transition: background 0.15s;
-}
-
-.mode-tab + .mode-tab {
-  border-left: 1px solid var(--border);
+  transition: background 0.15s, color 0.15s, box-shadow 0.15s;
 }
 
 .mode-tab.active {
   background: var(--primary);
   color: #fff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.25);
 }
 
 .mode-tab:hover:not(.active) {
-  background: var(--surface);
+  background: rgba(255, 255, 255, 0.45);
+  color: var(--text);
 }
 
-/* Reference mode strings */
+/* 听音调弦模式：琴弦列表 */
 .hint {
   font-size: 0.8rem;
   color: var(--text-dim);
@@ -678,24 +832,32 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
   align-items: center;
   gap: 14px;
   padding: 12px 16px;
-  background: var(--card);
-  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.4);
+  border: 1px solid var(--glass-border);
   border-left: 3px solid var(--color);
-  border-radius: 6px;
+  border-radius: 12px;
   color: var(--text);
   cursor: pointer;
-  transition: background 0.15s, box-shadow 0.15s;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: var(--glass-highlight), 0 1px 3px rgba(0, 0, 0, 0.04);
+  transition: background 0.15s, box-shadow 0.15s, transform 0.1s;
   font-size: 1rem;
 }
 
 .string-btn:hover {
-  background: #fafafa;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  background: rgba(255, 255, 255, 0.6);
+  box-shadow: var(--glass-highlight), 0 2px 10px rgba(30, 41, 80, 0.12);
+  transform: translateY(-1px);
+}
+
+.string-btn:active {
+  transform: translateY(0) scale(0.99);
 }
 
 .string-btn.playing {
-  background: #f0f0f8;
-  box-shadow: 0 1px 8px rgba(0,0,0,0.1);
+  background: rgba(255, 255, 255, 0.68);
+  box-shadow: var(--glass-highlight), 0 2px 14px rgba(30, 41, 80, 0.16);
 }
 
 .string-num {
@@ -728,7 +890,7 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
   font-family: 'SF Mono', 'Cascadia Code', monospace;
 }
 
-/* Listen mode */
+/* 实时听音模式 */
 .mic-area {
   text-align: center;
   margin-bottom: 18px;
@@ -739,30 +901,40 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
   align-items: center;
   gap: 6px;
   padding: 12px 28px;
-  background: var(--card);
+  background: rgba(255, 255, 255, 0.45);
   color: var(--text);
-  border: 1px solid var(--border);
+  border: 1px solid var(--glass-border);
   border-radius: 24px;
   font-size: 0.95rem;
   cursor: pointer;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: var(--glass-highlight), 0 2px 8px rgba(30, 41, 80, 0.08);
   transition: all 0.2s;
 }
 
 .mic-btn:hover {
-  border-color: var(--accent);
+  background: rgba(255, 255, 255, 0.65);
+  box-shadow: var(--glass-highlight), 0 3px 12px rgba(30, 41, 80, 0.14);
+  transform: translateY(-1px);
+}
+
+.mic-btn:active {
+  transform: translateY(0) scale(0.98);
 }
 
 .mic-btn.active {
   background: var(--primary);
-  border-color: var(--primary);
+  border-color: rgba(255, 255, 255, 0.3);
   color: #fff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), 0 4px 16px rgba(0, 0, 0, 0.2);
 }
 
 .mic-icon {
   font-size: 1.1rem;
 }
 
-/* Detection display */
+/* 识别结果显示 */
 .detection {
   display: flex;
   flex-direction: column;
@@ -814,7 +986,7 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
   margin-top: 4px;
 }
 
-/* Cents meter */
+/* 音分表 */
 .meter-wrap {
   position: relative;
 }
@@ -822,9 +994,13 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
 .meter-track {
   position: relative;
   height: 32px;
-  background: var(--surface);
+  background: rgba(255, 255, 255, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.45);
   border-radius: 16px;
   overflow: hidden;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: inset 0 1px 4px rgba(30, 41, 80, 0.08);
 }
 
 .meter-fill {
@@ -834,7 +1010,7 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
   height: 100%;
   background: linear-gradient(90deg, #e8d5a3 0%, #9ccd9c 35%, #9ccd9c 65%, #e8d5a3 100%);
   border-radius: 16px;
-  transition: width 0.08s ease;
+  transition: width 0.2s ease;
 }
 
 .meter-center {
@@ -896,7 +1072,7 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
   color: var(--warn);
 }
 
-/* Strings status list */
+/* 各琴弦状态列表 */
 .string-status-list {
   display: flex;
   flex-direction: column;
@@ -954,7 +1130,7 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
 .s-bar {
   height: 100%;
   border-radius: 3px;
-  transition: width 0.08s;
+  transition: width 0.2s;
 }
 
 .s-status {
@@ -963,7 +1139,7 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
   font-size: 0.75rem;
 }
 
-/* Placeholder */
+/* 占位提示 */
 .placeholder {
   text-align: center;
   color: var(--text-dim);
@@ -976,7 +1152,7 @@ const stringColors = ['var(--lo-e)', 'var(--a)', 'var(--d)', 'var(--g)', 'var(--
   opacity: 0.7;
 }
 
-/* Footer */
+/* 页脚 */
 .footer {
   text-align: center;
   font-size: 0.7rem;
